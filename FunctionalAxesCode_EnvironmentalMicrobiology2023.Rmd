@@ -1,0 +1,1346 @@
+---
+title: "Uncovering fundamental axes of microbial trait variation"
+author: "Geneviève Lajoie"
+output:
+  
+  html_notebook: default
+  html_document:
+  pdf_print: paged
+  pdf_document: default
+---
+
+<br />
+
+### Libraries
+
+Loading libraries.
+
+```{r Libraries, include=FALSE}
+library(reshape2)
+library(pvclust)
+library(ggplot2)
+library(phylobase)
+library(adephylo)
+library(adespatial)
+library(vegan)
+library(plyr)
+library(dplyr)
+library(ape)
+library(leaflet)
+library(corrplot)
+library(lsmeans)
+library(phylosignal)
+library(car)
+library(RColorBrewer)
+library(doParallel)
+library(dendextend) # load last
+
+```
+
+<br />
+
+### Data import
+
+Importing environment with formatted datatables and functions.
+
+```{r}
+# Combined dataset
+load("~/FunWorkspace.RData")
+
+```
+
+##### Metagenomic data
+
+Data:  
+  Functional datasets
+  *bac.98K* # Kegg-level
+  *kegtab.C*, *funC.mean*, *funC.mean.rel* # Tier 3 level
+  *kegg.cat* # Functional hierarchy
+  Taxonomic datasets
+  *bac.98K.taxo.cla*, *bac.98K.taxo.ord*, *bac.98K.taxo.phy* # Class, Order, Phylum
+  Metadata
+  *metadata*
+
+Values:  
+  *filenames*
+
+##### Genomic data
+
+Data:   -->
+   *nodes* -->
+   *tax* -> taxonomic annotations per genome -->
+   *fun.C* -> presence/absence of components of pathways for each genome -->
+   *fun1* -> fun.C without duplicated genomes and 0-variance functions -->
+   *funC.mean.g* -> abundance of components of pathways for each genome -->
+   *funC.mean.rel.g* -> mean relative abundance of components of pathways for each genome -->
+   *pruned.tree* -> phy object with tips not present in the fun1 object removed -->
+   *kegg.cat* -> kegg categories associated with each functional gene -->
+   *data.funcat* -> functional annotations of genomes including kegg categories -->
+   *phy* -> phylogenetic tree for genomes contained in whole dataset (nodes) -->
+
+Values:   -->
+   *gtdb.sub* -> List of gtdb ids that are present in subset database to obtain only one representative leaf per parent [nodes.uni] -->
+
+
+Importing other custom functions
+
+```{r}
+phyloWeights <- function(tree, dist.phylo = "patristic", method = "lag-norm",
+                         mu = 0, sigma = 5, dmax = 10, alpha = 1, beta = 1){
+  if (inherits(tree, "phylo4")){
+    tree <- as(tree, "phylo")
+  }
+  if (!inherits(tree, "phylo")){
+    stop("x has to be a phylo, phylo4 or phylo4d object")
+  }
+
+  method <- match.arg(method, c("lag-norm", "clade", "inverse", "exponential"))
+  
+  d <- cophenetic.phylo(tree)
+  d <- as.matrix(d)
+  
+  if(method == "lag-norm"){
+    w <- dnorm(d, mean = mu, sd = sigma)
+  }
+  
+  if(method == "clade"){
+    w <- ifelse(d < dmax, 1, 0)
+    w[rowSums(w) == 1, ] <- NA
+  }
+  
+  if(method == "inverse"){
+    w <- 1 / (d ^ alpha)
+  }
+  
+  if(method == "exponential"){
+    w <- exp(-beta * d)
+  }
+  
+  diag(w) <- 0
+  w <- prop.table(w, 1)
+  return(w)
+}
+
+
+phyloCorrelogram <- function(p4d, trait = names(tdata(p4d)),
+                             dist.phylo = "patristic", sigma = NULL,
+                             n.points = 100, ci.bs = 1000, ci.conf = 0.95){
+  
+  p4 <- phylobase::extractTree(p4d)
+  phy <- as(p4, "phylo")
+  new.order <- phy$edge[, 2][!phy$edge[, 2] %in% phy$edge[, 1]]
+  tips <- phy$tip.label[new.order]
+  n.tips <- length(tips)
+  X <- tdata(p4d, type = "tip")
+  X <- X[tips, trait]
+  X <- scale(X)
+  X <- as.data.frame(X)
+  colnames(X) <- trait
+  n.traits <- ncol(X)
+  if(is.numeric(trait)){
+    trait <- names(tdata(p4d))[trait]
+  }
+  
+  if(is.vector(dist.phylo) & is.character(dist.phylo)){
+    dist.phylo <- match.arg(dist.phylo, c("patristic", "nNodes", "Abouheif", "sumDD"))
+    D <- distTips(phy, method = dist.phylo)
+    D <- as.matrix(D)
+    D <- D[tips, tips]
+  } else {
+    if(is.matrix(dist.phylo)){
+      D <- dist.phylo[tips, tips]
+    } else {
+      stop("dist.phylo is not valid")
+    }
+  }
+  if(dist.phylo == "Abouheif"){
+    D.max <- max(D[D != max(D)] )
+  } else {
+    D.max <- max(D)
+  }
+  
+  if(is.null(sigma)){
+    sigma <- mean(colMeans(D)/(2 * 1.96))
+  }
+  
+  dist.points <- seq(0, D.max, length.out = n.points)
+  res <- matrix(NA, nrow = n.points, ncol = 4)
+  for(i in seq(1, n.points)){
+    res[i, 1] <- dist.points[i]
+    Wi <- phyloWeights(phy, dist.phylo = dist.phylo, method = "lag-norm", mu = dist.points[i], sigma = sigma)
+    Wi <- Wi[tips, tips]
+    if(n.traits < 2){
+      X <- as.vector(t(scale(X)))
+      bi <- boot::boot(X, function(x, z) moranTest(xr = x[z], Wr = prop.table(Wi[z, z], 1), reps = 0)$Moran.I, R = ci.bs)
+      res[i, 2:3] <- boot::boot.ci(bi, type = "norm", conf = ci.conf)$norm[2:3]
+      res[i, 4] <- bi$t0
+    } else {
+      X <- as.matrix(scale(X))
+      bi <- boot::boot(X, function(x, z) mantelStat(xr = x[z, ], Wr = prop.table(Wi[z, z], 1)), R = ci.bs)
+      res[i, 2:3] <- boot::boot.ci(bi, type = "norm", conf = ci.conf)$norm[2:3]
+      res[i, 4] <- bi$t0
+    }
+  }
+  res[, 2:3][res[, 2:3] > 1] <- 1
+  res[, 2:3][res[, 2:3] < -1] <- -1
+  
+  pcr <- list(res = res, trait = trait, dist.phylo = dist.phylo, sigma = sigma,
+              ci.bs = ci.bs, ci.conf = ci.conf, n = n.tips)
+  class(pcr) <- "phylocorrelogram"
+  return(pcr)  
+}
+
+
+```
+
+### Identifying functional axes in metagenomic dataset
+
+#### Functional variation across ecosystems
+
+##### Descriptive statistics
+
+```{r}
+# Distribution of habitats
+table(metadata$Eco_agg_3)
+```
+
+##### Alpha diversity
+
+```{r}
+##### Overview of functional cat diversity per sample
+
+# Richness
+matpa<-decostand(funC.mean, 'pa')
+rich<-rowSums(matpa)
+summary(rich)
+
+# Shannon
+hist(diversity(funC.mean, 'shannon'))
+
+# Richness object
+rich.o<-merge(rich,metadata[,c('MGRast_ID','Eco_agg_3')], by.x='row.names', by.y='MGRast_ID')
+rich.o<-merge(rich.o, diversity(funC.mean, 'shannon'), by.x='Row.names',by.y='row.names')
+colnames(rich.o)<-c('MGRast_ID','rich','Eco_agg_3','shannon')
+
+# Differences in alpha div among ecosystems -> guts/animals are less functionally diverse, plants/soil are most functionally diverse
+ggplot(rich.o, aes(x=Eco_agg_3, y=shannon))+
+  geom_boxplot()
+
+# Merge richness data
+metadata<-merge(metadata, rich.o, by=c('MGRast_ID','Eco_agg_3'), all.x=T)
+
+##### Test this by re-sampling equal number of samples per category
+
+# Create subset
+metsamp<-metadata %>%
+  group_by(Eco_agg_3) %>%
+  filter(n() >= 10) %>%
+  slice_sample(n=10, replace=F)
+
+# Only keep the metsamp samples
+matpa.st<-matpa[which(rownames(matpa)%in%metsamp$MGRast_ID),]
+matpa.st<-matpa.st[,which(colnames(matpa.st)%in%kegg.cat$C)]
+
+# Richness
+rich<-rowSums(matpa.st)
+summary(rich)
+
+# Shannon
+hist(diversity(funC.mean[which(rownames(funC.mean)%in%metsamp$MGRast_ID),], 'shannon'))
+
+# Richness object
+rich.o<-merge(rich,metadata[,c('MGRast_ID','Eco_agg_3')], by.x='row.names', by.y='MGRast_ID')
+rich.o<-merge(rich.o, diversity(funC.mean[which(rownames(funC.mean)%in%metsamp$MGRast_ID),], 'shannon'), by.x='Row.names',by.y='row.names')
+colnames(rich.o)<-c('MGRast_ID','rich','Eco_agg_3','shannon')
+
+# Differences in alpha div among ecosystems -> guts/animals are less functionally diverse, plants/soil are most functionally diverse
+# Relevel with host-associated vs environmental (terrestrial and marine)
+# Make 1 panel per measure
+ggplot(metadata, aes(x=Eco_agg_3, y=rich))+ # y=shannon
+  geom_boxplot()
+
+# Plot formatting
+metadata.m<-metadata
+metadata.m<-melt(metadata.m, measure.vars=c('rich','shannon'))
+colnames(metadata.m)[c((ncol(metadata.m)-1):ncol(metadata.m))]<-c('rich.var','rich.val')
+
+metadata.m$Eco_agg_3<-factor(metadata.m$Eco_agg_3, levels=c('Mammalia','Insecta','Aves','Porifera','VascularPlants','Bryophyta','Freshwater','Saltwater', 'Saltwater sediment','Soil'))
+
+stat_box_data <- function(y, upper_limit = -Inf) {
+  return( 
+    data.frame(
+      y = 0.95 * upper_limit,
+      label = paste('n =', length(y), '\n')
+    )
+  )
+}
+
+### SUPP FIGURE RICHNESS
+ggplot(metadata.m, aes(x=Eco_agg_3, y=rich.val))+ # y=shannon
+  geom_boxplot()+
+  stat_summary(fun.data = stat_box_data, geom = "text", col='darkgrey', size=3) +
+  facet_wrap(~rich.var, scales='free_y')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+## ADD RESULTS FROM 'PAIRS'
+
+# Shannon Anova
+mod<-lm(shannon~Eco_agg_3, data=metadata) # or rich.o
+rich.aov<-Anova(mod, type='III')
+rich.aov
+
+# Post-hoc comparisons
+lsm<-emmeans(object=mod, specs="Eco_agg_3")
+plot(lsm, comparisons = TRUE, adjust='mvt')
+pairs(lsm, adjust = "mvt")
+
+# Richness Anova
+mod<-lm(rich~Eco_agg_3, data=metadata)
+rich.aov<-Anova(mod, type='III')
+rich.aov
+
+# Post-hoc comparisons
+lsm<-lsmeans(mod, ~Eco_agg_3)
+plot(lsm, comparisons = TRUE)
+pairs(lsm, adjust = "mvt")
+
+```
+
+##### Ordination
+
+Classification of samples based on functional cat composition
+```{r}
+
+mat<-decostand(funC.mean, method='hellinger')
+
+# Hellinger distance
+cog.pcoa.dist<-dist.ldc(funC.mean, method='hellinger')
+
+
+# PCoA
+pcoa.m3 <- cmdscale(cog.pcoa.dist, k=nrow(mat)-1, eig=T)
+# % variances
+pcoa.m2 <- pcoa(cog.pcoa.dist, correction="lingoes") # use pcoa.m2$values to get %variance
+pcoa.m2$values
+
+# Quick and dirty plot
+groups <- metadata$Eco_agg_3[match(rownames(mat), metadata$MGRast_ID)]
+
+# Plot
+mi<-1
+ma<-2
+ord<-ordiplot(pcoa.m3, choices=c(1,2), type='none')
+text(ord, 'sites', labels=metadata$Eco_label[match(rownames(mat), metadata$MGRast_ID)], cex=0.7)
+# Set colors of groups in the order of : names(table(groups))
+# Blue for water (4), red for soil (2) and sediments, green for hosts (3) : use arg. 'col'
+ordispider(pcoa.m3, choices=c(1,2),groups, display = "sites", kind = "se", lty=c(1), conf = 0.95, alpha = 0.05, lwd = 1.5, label=TRUE, col=c(3,3,4,3,3,3,4,2,2,3)) # , col=c(3,3,4,3,3,3,4,2,2,3)
+
+```
+
+How does db-type account for variation in the dataset?
+```{r}
+# Pcoa accounting for dataset differences (MG-RAST vs IMG)
+pcoa.db<-capscale(mat~1 + Condition(metadata$DB[match(rownames(mat), metadata$MGRast_ID)]), metadata, dist='bray')
+pcoa.db # ~1.9% of variation explained by DB using Bray dist
+```
+
+How does functional richness account for variation in the dataset?
+```{r}
+pcoa.db<-capscale(cog.pcoa.dist~1 + Condition(metadata$rich[match(rownames(mat), metadata$MGRast_ID)]), metadata)
+pcoa.db # ~14% of variation explained by rich using Hellinger dist
+
+# Quick and dirty plot
+groups <- metadata$Eco_agg_3[match(rownames(mat), metadata$MGRast_ID)]
+
+# Plot
+mi<-1
+ma<-2
+ord<-ordiplot(pcoa.db, choices=c(1,2), type='none')
+text(ord, 'sites', labels=metadata$Eco_label[match(rownames(mat), metadata$MGRast_ID)], cex=0.7)
+# Set colors of groups in the order of : names(table(groups))
+# Blue for water (4), red for soil (2) and sediments, green for hosts (3) : use arg. 'col'
+ordispider(pcoa.db, choices=c(1,2),groups, display = "sites", kind = "se", lty=c(1), conf = 0.95, alpha = 0.05, lwd = 1.5, label=TRUE, col=c(3,3,4,3,3,3,4,2,2,3)) # , col=c(3,3,4,3,3,3,4,2,2,3)
+
+# Comparison of ordination results
+plot(procrustes(pcoa.m3,pcoa.db))
+protest(pcoa.m3,pcoa.db) # Highly correlated (0.702)
+
+# Differences in diversity among the environmental groupings, but controlling for richness doesn't affect the functional classification between groups
+adonis2(cog.pcoa.dist~metadata$rich[match(rownames(mat), metadata$MGRast_ID)])
+
+```
+
+How does habitat & taxonomy account for variation in the dataset?
+```{r}
+# Effect of habitat
+perm.hab<-adonis2(cog.pcoa.dist ~ metadata$Eco_agg_3[match(labels(cog.pcoa.dist), metadata$MGRast_ID)])
+perm.hab
+
+# What effect of taxonomy
+# Dummy set
+taxind<-bac.98K.taxo.cla.a
+taxind<-decostand(taxind, 'total')
+taxind<-taxind[which(rownames(taxind)%in%rownames(mat)),]
+
+# Make sure the two files are ordered the same
+plot(match(rownames(taxind),rownames(mat)))
+
+# Merge environmental data with taxonomic data
+taxenv<-merge(taxind, metadata, by.x=c('row.names'), by.y=c('MGRast_ID'), all.x=T)
+
+# Need to create a dummy environmental variable matrix because varpart does not process factors
+env<-as.data.frame(taxenv$Eco_agg_3) # Try Eco_agg (finer) and Eco_agg_2 (coarser)
+envm<-model.matrix(~env$`taxenv$Eco_agg_3`, env)[,-1] # First level does not show up
+if (length(which(colSums(envm)==0))>0) envm<-envm[,-which(colSums(envm)==0)]
+
+# Variation partitioning
+varmod<-varpart(Y=cog.pcoa.dist, X=envm, Z=taxind[,-1]) # taxind[,which(colnames(taxind)%in%subep)]
+plot(varmod)
+
+
+# Nested taxonomy
+perm.hab<-lm(taxind[,-1] ~ metadata$Eco_agg_3[match(labels(cog.pcoa.dist), metadata$MGRast_ID)])
+perm.hab
+
+```
+
+
+Calculate contributions (R2) of the different functions to the ordination (axis by axis)
+```{r}
+# Using envfit function to identify R2 by variable for each dimension from 1 to 4 (first 4 axes account for ~74% of variance) + "direction of influence"='score'
+# See number of significant dimensions in the pcoa.m3 object
+
+cl<-makeCluster(12)
+registerDoParallel(cl)
+
+# Long to compute (!)
+contrib<-foreach(i=1:4, .combine='rbind', .multicombine=T) %dopar% {
+  cont<-vegan::envfit(pcoa.m3, mat, choices=c(i))$vectors
+  cont<-as.data.frame(cbind(cont$arrows,cont$r,cont$pvals))
+  colnames(cont)[1]<-'Dir'
+  cont$Dim<-paste('Dim', i, sep='.')
+  cont$C<-rownames(cont)
+  cont
+}
+
+stopCluster(cl)
+
+colnames(contrib)[2:3]<-c('r2','p.val')
+
+```
+
+Boxplot of contributions of functions to axes, by A/B categories (visualization tool)
+
+```{r}
+# Extract functional categories
+bb<- kegg.cat[,c(1,2,3)] %>% distinct()
+bb<-bb[-which(bb$C=='Others'&bb$B=='Genetic information processing'),] # No 'Others' belonging to that cat among the keggs from bac.98K
+
+# Merge with kegg.cat
+fc.cog<-merge(contrib, bb, by=c('C'),all.x=T)
+# Grouping by B categories > A
+fc.cog<-fc.cog[order(fc.cog$A,fc.cog$B),]
+fc.cog$B<-factor(fc.cog$B, levels=unique(fc.cog$B))
+fc.cog$A<-factor(fc.cog$A, levels=unique(fc.cog$A))
+fc.cog.m<-fc.cog # Keep the object in store
+
+# Calculating mean contributions across all categories, per dimensions
+agg.mean<-aggregate(r2~Dim, fc.cog.m, mean)
+colnames(agg.mean)[2]<-'r2.mean'
+fc.cog.m<-merge(fc.cog.m,agg.mean, by='Dim', all.x=T)
+fc.cog.m<-fc.cog.m[which(fc.cog.m$Dim%in%c('Dim.1','Dim.2','Dim.3','Dim.4')),] # Only keep first 4 dims
+
+# Storing contribution to variance of the dimension in column name
+pcoa.eig <- pcoa.m3$eig/sum(pcoa.m3$eig) # Gives relative %variance
+perc<-pcoa.eig[1:4]
+fc.cog.m$Dim<-as.factor(fc.cog.m$Dim)
+levels(fc.cog.m$Dim)<-paste(levels(fc.cog.m$Dim), ' (', round(perc,2), ')', sep='')
+
+# Only keep sig contributions
+# fc.cog.m<-fc.cog.m[which(fc.cog.m$p.val<0.05),]
+
+### Plotting by A/B category facetting the dimensions as rows
+
+ggplot(fc.cog.m, aes(x=B, y=r2, col=A)) + 
+  geom_boxplot()+
+  geom_hline(yintercept=fc.cog.m$r2.mean, linetype="dashed", color='black', size=0.5) +
+  #stat_summary(fun.data = stat_box_data, geom = "text", hjust = 0.5, vjust = 0.9, col='black', cex=3)+
+  facet_grid(rows=vars(fc.cog.m$Dim), cols=vars(fc.cog.m$A), scales="free") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
+```{r}
+# Check this: help("models", package = "emmeans")
+# https://cran.r-project.org/web/packages/emmeans/vignettes/comparisons.html
+
+# Distances between functions based on PCoA scores
+contrib.c<-fc.cog
+#contrib.c<-contrib.c[-which(contrib.c$Dim=='All'),]
+contrib.c$C<-as.factor(contrib.c$C)
+contrib.c$Dim<-as.factor(contrib.c$Dim)
+contrib.c$r<-contrib.c$r2*as.numeric(contrib.c$Dir)
+contrib.a<-acast(contrib.c, C~Dim, value.var='r', fill=0)
+
+#######
+
+dag<-aggregate(data=contrib.c, r2~B, FUN=mean)
+dag<-dag[order(dag$r2, decreasing=T),]
+dag$B[1:10]
+
+# Standardize contribution for each B cat
+contrib.std<-decostand(contrib.a, 'standardize') 
+contrib.std<-melt(contrib.std)
+colnames(contrib.std)<-c('C','Dim','value')
+contrib.std<-merge(contrib.std ,bb, by='C', all.x=T)
+
+# Evaluate differences in the contribution of different B cats to the axes
+model<-lm(value~B*Dim, contrib.std[which(contrib.std$B%in%dag$B[1:15]),])
+Anova(model, type="III") # With A and B
+lsm<-lsmeans(model, ~B|Dim)
+pwpm(lsm, adjust='mvt')
+plot(lsm, adjust='mvt',comparisons = TRUE)
+pwpp(lsm)
+
+```
+
+#### Hierarchical agglomerative clustering
+
+##### Keggs
+
+Following "Species Associations" approach by Legendre
+http://biol09.biol.umontreal.ca/PLcourses/Species_associations.pdf
+
+Generate dendrogram ## WEIGHTED BY AXIS??
+!! Could remove the last non-informative dimensions...
+
+```{r}
+# Q2: Distances between functions 
+
+cog.Dm3<-dist(scale(contrib.a))
+
+# THEN
+
+# Ward agglomerative clustering
+cog.clust<-hclust(cog.Dm3, 'ward.D2')
+
+# Generating dendrogram (cog.Da and cog.Db for comparing them)
+cc.m3<-as.dendrogram(cog.clust)
+```
+
+Quick and dirty plot
+
+```{r}
+# Plot
+par(mar=c(16,2.5,2.5,1))
+plot(cc.m3, main='Metagenomic functional dendrogram')
+```
+
+
+```{r}
+# How many clusters?
+library(NbClust)
+diss<-as.matrix(cog.Dm3)
+nc<-NbClust(data=scale(contrib.a), distance="euclidean", method='ward.D2')
+
+```
+
+
+#### Dendrogram of functional axes
+
+##### C-cats
+
+```{r}
+# Plotting with dendextend
+# pvclust object can also be plotted with dendextend
+# https://cran.r-project.org/web/packages/dendextend/vignettes/introduction.html#pvclust
+res.19K.hel<-mat
+
+dend <- cc.m3 # as.dendrogram(fit.m) OR cc.m3
+
+# Color based on A category
+# C-version
+bb<- kegg.cat[,c(1,2,3)] %>% distinct()
+bb<-bb[-which(bb$C=='Others'&bb$B=='Genetic information processing'),] # No 'Others' belonging to that cat among the keggs from bac.98K
+
+xx<- bb
+xx<-xx[match(colnames(res.19K.hel)[which(colnames(res.19K.hel)%in%(cc.m3 %>% labels))],xx$C),] # Order to match the fun.C2.9K object
+
+# colors to use: 
+colors_to_use <- as.numeric(factor(xx[,1]))
+# shapes to use:
+xx$shape<-NA
+for (i in 1:length(unique(xx$A))){
+  xx[which(xx$A==unique(xx$A)[i]),4]<-match(xx[which(xx$A==unique(xx$A)[i]),]$B,unique(xx[which(xx$A==unique(xx$A)[i]),]$B))
+}
+shapes_to_use<-xx$shape
+
+# But sort them based on their order in dend:
+colors_to_use <- colors_to_use[order.dendrogram(dend)]
+shapes_to_use <- shapes_to_use[order.dendrogram(dend)]
+labels_colors(dend) <- colors_to_use
+
+# Color branches by genomic groups to compare with groupings from OPTION 1
+labels.m <- dend %>% labels
+labels.m <- as.data.frame(labels.m)
+
+### Adding colored bars with pcoa R2 groupings from below
+contrib.bar<-contrib.a[,which(colnames(contrib.a)%in%c('Dim.1','Dim.2','Dim.3','Dim.4'))]
+contrib.bar<-contrib.bar[match(labels.m[,1],rownames(contrib.bar)),]
+contrib.bar<-apply(contrib.bar,2,FUN=function(x) x/(max(abs(x))))
+
+# Generate color lookup table (all tog)
+max(abs(contrib.bar)) # 0.75
+scale_range <- c(-1.0, 1.0) # Needs to be symmetric
+pal<-colorNumeric("RdBu", domain = scale_range)
+contrib.col<-apply(contrib.bar,2,pal)
+rownames(contrib.col)<-rownames(contrib.bar)
+
+# Adding colored bars with abundance
+abund<-as.data.frame(colSums(res.19K.hel))
+rownames(abund)<-colnames(res.19K.hel)
+abund<-abund[match(rownames(contrib.bar),rownames(abund)),,drop=F]
+
+# Generate color lookup table (all tog)
+max(abs(abund)) # 18.5
+scale_range2 <- c(0,30)
+pal2<-colorNumeric("YlOrRd", domain = scale_range2)
+abund.col<-apply(abund,2,pal2)
+rownames(abund.col)<-rownames(abund)
+
+# Print legend (use screenshot)
+# leaflet(abund) %>%
+#   addTiles() %>%
+#   addLegend(pal = pal2, values = ~scale_range2, position = "bottomleft", opacity=1)
+
+# Legends material
+leg<-xx[!duplicated(xx[,-3]),]
+leg<-leg[order(leg$A,leg$B),]
+
+# Plotting
+# If set function not working, unload data.table
+par(mar=c(6,2.5,2.5,0))
+dend %>% #pvclust_show_signif(fit.m, show_type = "lwd", alpha=0.05) %>% 
+ set("leaves_pch", 19) %>%  # node point type # , shapes_to_use # ou 19
+ set("leaves_cex", 0.80) %>%  # node point size
+ set("leaves_col", colors_to_use) %>% #node point color colors_to_use
+  set("labels_cex", 0.0001) %>% # 0.75
+  set("branches_k_color", k = 9, value=brewer.pal(9, "Paired")) %>% set("branches_lwd", 3) %>%
+  plot(main = "Cluster dendrogram")
+
+#legend("topright", legend = levels(xx[,1]), fill = c(1:5), cex = 0.75, text.width=25, bty='n', pt.cex=0.75, y.intersp=0.7) # Legend with colors only
+#legend("topright", legend = leg[,2], col = as.numeric(leg[,1]), pch=leg$shape, cex = 1, text.width=25, bty='n', pt.cex=1, y.intersp=0.5) # Legend with colored shapes
+# Add symbols as well
+colored_bars(contrib.col, dend, sort_by_labels_order = F, rowLabels= colnames(contrib.col),y_shift=-1)# y_shift=-4
+colored_bars(abund.col, dend, sort_by_labels_order = F, y_shift=-3)
+legend("topright", legend = leg[,2], col = as.numeric(as.factor(leg[,1])), pch=leg$shape, cex = 0.7, text.width=25, bty='n', pt.cex=0.8, y.intersp=0.7) # Legend with colored shapes
+
+```
+
+
+```{r}
+# Chi-square test of proportion of C-cats per group
+
+## Test how deviant from normal is the distribution of functional genes among groups
+
+groups8G<-cutree(cc.m3, k=9, order_clusters_as_data = FALSE)
+grp.col<-as.data.frame(cbind(colors_to_use, groups8G,1))
+bb<-kegg.cat[,c(1:3)]
+bb<-bb[!duplicated(bb),]
+grp.B<-merge(grp.col,bb, by.x='row.names', by.y='C', all.x=T)
+colnames(grp.B)[1]<-'C'
+
+## B
+#grpa<-funC.mean[,-which(colSums(funC.mean)<200)]
+grpa<-acast(grp.B, groups8G~B, value.var="V3") # Do it for A & B
+#grpa<-grpa[,-which(colSums(grpa)<10)]
+# Chi-square test
+chisq <- chisq.test(grpa)
+round(chisq$residuals, 3)
+corrplot(chisq$residuals, is.cor = FALSE)
+
+# Contibution in percentage (%)
+contribt <- 100*chisq$residuals^2/chisq$statistic
+round(contribt, 3)
+# Visualize the contribution
+corrplot(contribt, is.cor = FALSE)
+
+## A
+#grpa<-funC.mean[,-which(colSums(funC.mean)<200)]
+grpa<-acast(grp.B, groups8G~A, value.var="V3") # Do it for A & B
+# Chi-square test
+chisq <- chisq.test(grpa)
+round(chisq$residuals, 3)
+corrplot(chisq$residuals, is.cor = FALSE)
+
+```
+
+
+### Contributions of env vs. taxonomy to metagenomic variation
+
+#### Ordination plot
+
+##### C-cats
+
+Quick and dirty plot
+
+```{r}
+# Dimensions
+mi<-1
+ma<-2
+
+## Define functional categories to plot
+efit.fun<-envfit(pcoa.m3, mat, choices=c(mi:ma))
+
+  # Pick most correlated functions for each axis
+  contrib.siga<-contrib[which(contrib$p.val<=0.001&contrib$Dim%in%paste('Dim',mi,sep='.')&contrib$Dir==1),]
+  contrib.siga<-contrib.siga[order(-contrib.siga$r2),]
+  contrib.siga<-contrib.siga[c(1:5),]
+  
+  contrib.siga2<-contrib[which(contrib$p.val<=0.001&contrib$Dim%in%paste('Dim',mi,sep='.')&contrib$Dir==(-1)),]
+  contrib.siga2<-contrib.siga2[order(-contrib.siga2$r2),]
+  contrib.siga2<-contrib.siga2[c(1:5),]
+  
+  contrib.sigb<-contrib[which(contrib$p.val<=0.001&contrib$Dim%in%paste('Dim',ma,sep='.')&contrib$Dir==1),]
+  contrib.sigb<-contrib.sigb[order(-contrib.sigb$r2),]
+  contrib.sigb<-contrib.sigb[c(1:5),]
+  
+    contrib.sigb2<-contrib[which(contrib$p.val<=0.001&contrib$Dim%in%paste('Dim',ma,sep='.')&contrib$Dir==(-1)),]
+  contrib.sigb2<-contrib.sigb2[order(-contrib.sigb2$r2),]
+  contrib.sigb2<-contrib.sigb2[c(1:5),]
+  
+  
+  contrib.sig<-rbind(contrib.siga,contrib.siga2,contrib.sigb,contrib.sigb2)
+  # Names of these functions
+  funsig<-unique(contrib.sig$C)
+  # Regenerate efit object
+  efit.fun<-envfit(pcoa.m3, mat[,which(colnames(mat)%in%funsig)], choices=c(mi:ma))
+
+## Define colors of these groups (based on dendrogram)
+# Divide into groups
+col.arrow<-cutree(dend, k=9, order_clusters_as_data = FALSE)
+# Assign colors
+cols.a<-brewer.pal(9, "Paired")[match(col.arrow,unique(col.arrow[match(labels(dend),names(col.arrow))]))]
+names(cols.a)<-names(col.arrow)
+col = cols.a[which(names(cols.a)%in%rownames(efit.fun$vectors$arrows))]
+col<-col[match(rownames(efit.fun$vectors$arrows),names(col))]
+
+## Define taxonomic groups to plot
+efit.phyl <- envfit(pcoa.m3, taxind, choices=c(mi:ma))
+ep<-as.data.frame(efit.phyl$vectors[[1]])
+subep<-which(efit.phyl$vectors$pvals<=0.001) # By pval, could also be by R2
+# Regenerate efit object
+
+# subep<-sort(efit.phyl$vectors$r,decreasing=T)[1:10]
+
+efit.phyl <- envfit(pcoa.m3, taxind[,which(colnames(taxind)%in%names(subep))], choices=c(mi:ma))
+
+## Groups - Environment
+groups <- metadata$Eco_agg_3[match(rownames(mat), metadata$MGRast_ID)]
+
+## Overall plot (7 x 9 po)
+ord<-ordiplot(pcoa.m3, choices=c(mi,ma), type='none')
+text(ord, 'sites', labels=metadata$Eco_label[match(rownames(mat), metadata$MGRast_ID)], cex=0.6)
+# Set colors of groups in the order of : names(table(groups))
+# Blue for water (4), red for soil (2) and sediments, green for hosts (3) : use arg. 'col'
+ordiellipse(pcoa.m3, choices=c(mi,ma), groups, display = "sites", kind = "se", lty=(1), conf = 0.95, alpha = 0.05, label=TRUE, cex=1.0) # , col=c(3,3,4,3,3,3,4,2,2,3)
+# Add taxonomic groups
+plot(efit.phyl, cex=0.8, lwd=4)
+
+# Add functions
+#plot(efit.fun, col=col, cex=0.9)
+
+efit.rich<-envfit(pcoa.m3, metadata$rich[match(rownames(mat), metadata$MGRast_ID)], choices=c(4))
+efit.rich
+```
+
+Check the relationship between functional richness and ordination axes
+```{r}
+sco<-pcoa.m3$points[,4]
+rich<-rich[match(names(sco),names(rich))]
+summary(lm(rich~sco))
+plot(rich~sco)
+```
+
+
+#### Taxonoimc explanatory models
+
+Identifying taxa contributing most to variance 
+
+Model relationship
+
+```{r}
+fun3<-mat[which(rownames(mat)%in%rownames(taxind)),]
+
+# Variation partitioning
+varmod<-varpart(fun3, envm, taxind) # taxind[,which(colnames(taxind)%in%subep)]
+plot(varmod)
+
+```
+
+<br />
+
+### Phylogenetic structure of functional axes
+
+#### i) PPCA approach
+```{r}
+# https://rdrr.io/rforge/adephylo/man/ppca.html
+# The analysis returns principal components maximizing the product of variance of the scores and their phylogenetic autocorrelation (Moran's I), therefore reflecting life histories that are phylogenetically structured.
+
+# Pruning datasets to genomes selected in the phylogeny and pruning the tree to these genomes
+dat<-funC.mean.rel.g
+colnames(dat)<-gsub(' \\[(.)*', '', colnames(dat))
+#dat<-dat[,which(colnames(dat)%in%colnames(fun.C2.19K))]
+dat<-dat[which(rownames(dat)%in%pruned.tree$tip.label),]
+dat<-decostand(dat, method='hellinger')
+
+liz.tre<-drop.tip(pruned.tree,setdiff(pruned.tree$tip.label,rownames(dat)))
+
+# Build phylo4d object
+liz.4d.3 <- phylo4d(liz.tre, tip.data=dat)
+
+# Perform pPCA ## LONG to run!!
+liz.ppca3 <- ppca(liz.4d.3, scale=FALSE, scannf=FALSE, nfposi=5, method="Abouheif")
+# Positive eigenvectors as global factors, negative eigenvectors as local factors
+rownames(liz.ppca3$c1)<-colnames(dat)
+
+```
+
+```{r}
+# Evaluate correlation between phylogenetic depth and explanatory power along different axes
+
+# To accelerate, provide the phylogenetic distance matrix so it is not recalculated for every trait & use only 10 points
+
+# Phylogenetic distance matrix -> calculation within the function with distTips takes forever
+# Verified that the 2 functions gave the same distance
+phyldist<-cophenetic.phylo(liz.tre) # Needs to be a matrix
+
+# Which traits are shared with metagenomes
+coln<-colnames(funC.mean)
+coln<-gsub(' \\[(.)*', '', coln)
+coln = gsub('[^A-Za-z0-9]', '.', coln)
+idt<-which(names(tdata(liz.4d.3))%in%coln)
+
+
+# Do it in parallel processes to gain some speed (1 trait per core, for ~4 at a time uses ~150 GB of RAM)
+cl<-makeCluster(4)
+registerDoParallel(cl)
+
+# Long to compute (!)
+phylocor2<-foreach(i = idt[101:200], .packages=c('phylosignal','phylobase')) %dopar% {
+    vp<-phyloCorrelogram(liz.4d.3, trait = names(tdata(liz.4d.3))[i], dist.phylo=phyldist, n.points = 15, ci.bs = 100) # Could increase ci.conf at 0.99
+    vp$dist.phylo<-NULL # Distance metric takes a lot of space. We already have it in the phyldist object
+    vp
+}
+
+stopCluster(cl)
+
+
+
+# Plot
+par(mfrow=c(5,5))
+for (i in c(1:25)){
+  plot(pc[[i]])
+}
+
+# Check distribution correlations at different depths
+
+###########################################
+# Compile (starting from pc object)
+phylocomp<-NULL
+for (i in c(1:length(pc))){
+  samp<-cbind(pc[[i]]$res,pc[[i]]$trait)
+  phylocomp<-rbind(phylocomp,samp)
+}
+
+phylocomp<-as.data.frame(phylocomp)
+
+# Extract functional categories
+bb<- kegg.cat[,c(1,2,3)] %>% distinct()
+bbc<- bb
+bbc$C2<-gsub(' \\[(.)*', '', bbc$C)
+bbc$C2 = gsub('[^A-Za-z0-9]', '.', bbc$C2)
+# Rmove points from rownames
+phylocomp$V5<-bbc$C[match(phylocomp$V5, bbc$C2)]
+
+# Add funCat
+phylocomp<-merge(phylocomp, bbc[,c(1:3)], by.x='V5', by.y='C', all.x=T)
+phylocomp$V1<-as.factor(phylocomp$V1)
+phylocomp$V4<-as.numeric(phylocomp$V4)
+
+unique(phylocomp$A)
+
+# Variation in correlation among B categories at different depths
+ggplot(phylocomp, aes(x=as.factor(V1), y=V4, fill=A))+ # [which(phylocomp$A=='Cellular Processes'),]
+  geom_boxplot()
+
+ggplot(phylocomp, aes(x=V1, y=V4, group=A, color=A))+ # [which(phylocomp$A=='Cellular Processes'),]
+  geom_point()+
+  geom_smooth(method='loess', se=T)+
+  facet_wrap(~A)
+
+# Or pick only a subset of certain C cats
+# Compare traits among themselves (all seem to exhibit phylosignal)
+
+# To get at depth of phylogenetic signal, can also compare mean values of traits per taxonomic category -> but issue with replication (clades nested within each other...)
+
+# Relationship between explanatory power (among metagenomes = contrib object) and phylogenetic autocorrelation at different depths (among genomes)
+contrib1<-contrib[which(contrib$Dim=='Dim.1'),]
+contrib1$corr<-contrib1$Dir*sqrt(contrib1$r2) # Take sqrt here
+
+phylocomp2<-merge(phylocomp, contrib1[,c('Dir','C','r2','corr')], by.x='V5', by.y='C', all.x=T)
+
+# For 5 depths
+unidept<-unique(phylocomp2$V1)[c(1,4,8,12,15)]
+
+phyldat<-phylocomp3[which(phylocomp3$V1%in%unidept&phylocomp3$Dim=='Dim.3'),]
+
+ggplot(phylocomp3[which(phylocomp3$V1%in%unidept),], aes(x=corr, y=abs(V4), group=Dir))+ # , color=B
+  geom_point(size=0.4)+
+  geom_smooth(method="lm",  se=F, color='black') +
+  theme_bw() + # formula = y ~ x + I(x^2),
+  facet_grid(Dim~V1, scales='free') # Garder seulement les pentes significatives
+
+# With depth as a continuous factor -> do this for every dimension
+mods<-lm(sqrt(abs(V4))~abs(corr)*V1+abs(corr):Dir+abs(corr):V1:Dir, phyldat)
+summary(mods)
+anova(mods)
+
+# Run models for each of 4 dim and for each depth
+phyldat<-phylocomp3[which(phylocomp3$V1%in%unidept&phylocomp3$Dim=='Dim.4'),]
+
+# By dir
+mods<-lm(sqrt(abs(V4))~abs(corr)*V1, phyldat[which(phyldat$Dir==1),])
+summary(mods)
+anova(mods)
+
+mods<-lm(sqrt(abs(V4))~abs(corr)*V1, phyldat[which(phyldat$Dir==-1),])
+summary(mods)
+anova(mods)
+
+# Compare slopes
+m.lst <- emtrends(mods, "V1", var="abs(corr)")
+m.lst
+pairs(m.lst)
+
+# https://stats.stackexchange.com/questions/365466/significance-of-slope-different-than-zero-in-triple-interaction-with-factors
+summary(m.lst, infer=c(TRUE,TRUE),null=0)
+
+# Compare intercepts
+emm = emmeans(mods, "V1", at = list("abs(corr)" = 0))
+emm
+pairs(emm)
+
+# Traits that are important for metagenomic variation across the pcoa have stronger signal in the genomic phylogeny. The signal is particularly stronger in traits that have explanatory power at smaller phylogenetic depths
+
+phylocomp3<-merge(phylocomp, contrib[,c('Dir','C','r2','Dim')], by.x='V5', by.y='C', all.x=T)
+phylocomp3$corr<-phylocomp3$Dir*sqrt(phylocomp3$r2) # Take sqrt here
+
+ggplot(phylocomp2[which(phylocomp2$V1%in%unidept),], aes(x=sqrt(abs(corr)), y=abs(V4), color=B))+ # , color=B
+  geom_point()+
+  geom_smooth(method="lm",  se=F) + # formula = y ~ x + I(x^2),
+  facet_wrap(~V1, scales='free')
+
+# Does signal vary as a function of A/B across depths
+phylocomp2$A<-as.factor(phylocomp2$A)
+mods<-lm(abs(V4)~A*V1, phylocomp2[which(phylocomp2$V1%in%unidept&phylocomp2$A!='Unclassified'),])
+summary(mods)
+anova(mods)
+
+ggplot(phylocomp2[which(phylocomp2$V1%in%unidept&phylocomp$A=='Metabolism'),], aes(x=V1, y=abs(V4), fill=B))+ # , color=B
+  geom_boxplot()+
+  theme_bw()
+
+# -> Use this one : transpose + remove unclassified A category
+lst<-emmeans(object=mods, "A", by="V1")
+plot(lst, comparisons = TRUE, adjust='mvt') 
+
+# Examine if each is different from 0
+summary(lst, infer=c(TRUE,TRUE),null=0)
+
+
+## models
+
+mods<-lm(abs(V4)~B*V1, phylocomp2[which(phylocomp2$V1%in%unidept&phylocomp2$A=='Environmental Information Processing'),]) # Metabolism, Genetic Information Processing, Cellular Processes, Environmental Information Processing
+summary(mods)
+anova(mods)
+
+lst<-emmeans(object=mods, "B", by="V1")
+plot(lst, comparisons = TRUE, adjust='mvt')
+
+
+## By cluster
+
+phylocomp2<- merge(phylocomp2, as.data.frame(groups8G), by.x='V5', by.y='row.names', all.x=T)
+phylocomp2$groups8G<-as.factor(phylocomp2$groups8G)
+## V1 as an ordered factor
+phylocomp2$V1<-factor(phylocomp2$V1, ordered=TRUE)
+
+
+
+mods<-lm(V4~groups8G*V1, phylocomp2[which(phylocomp2$V1%in%unidept),]) # Metabolism, Genetic Information Processing, Cellular Processes, Environmental Information Processing
+summary(mods)
+Anova(mods, type='III')
+
+lst<-emmeans(object=mods, "groups8G", by="V1")
+plot(lst, comparisons = TRUE, adjust='mvt')
+
+
+pairs(lst, adjust = "mvt")
+
+# All signal different than 0, even at the 0.022185 depth
+t.test(abs(phylocomp2$V4[which(phylocomp2$V1==as.character(unidept[3])&phylocomp2$groups8G==8)]))
+
+mfull<-lm(abs(V4)~groups8G, phylocomp2[which(phylocomp2$V1%in%unidept[3]),])
+m.red<-aov(abs(V4)~0, phylocomp2[which(phylocomp2$V1%in%unidept[3]),])
+anova(m.red, mfull)
+
+
+```
+#### Hierarchical agglomerative clustering based on ppca scores
+
+```{r}
+# Perform clustering based on ppca scores
+# Binary distances between functions (accomodates presence-absence data)
+# Extract functional categories
+bb<- kegg.cat[,c(1,2,3)] %>% distinct()
+bbc<- bb
+bbc$C2<-gsub(' \\[(.)*', '', bbc$C)
+bbc$C2 = gsub('[^A-Za-z0-9]', '.', bbc$C2)
+# Rmove points from rownames
+rownames(liz.ppca3$c1)<-bbc$C[match(rownames(liz.ppca3$c1), bbc$C2)]
+  
+  
+cog.Dg<-dist(scale(liz.ppca3$c1[,c(1:4)])) # For 5 "global" axes
+# Almost equivalent to: cog.D<-dist.binary(t(fun1), method=1) # 10 methods available 
+# Using dist(method='binary') will make it compatible with pvclust
+# Binary coefficients weight rare species the same as common species, and should be used whenever one wishes to weight all species on an equal footing.
+
+# Ward agglomerative clustering
+cog.clust.g<-hclust(cog.Dg, 'ward.D2')
+
+# Generating dendrogram (cog.Da and cog.Db for comparing them)
+cc.g<-as.dendrogram(cog.clust.g)
+```
+
+Quick and dirty plot
+
+```{r}
+# Plot
+par(mar=c(16,2.5,2.5,1))
+plot(cc.g, dLeaf=0.1, main='Phylogenetic functional dendrogram')
+```
+
+Full dendrogram plot
+
+```{r}
+# Plotting with dendextend
+# pvclust object can also be plotted with dendextend
+# https://cran.r-project.org/web/packages/dendextend/vignettes/introduction.html#pvclust
+
+dend <- as.dendrogram(cc.g)
+
+# Color based on A category
+bb<- kegg.cat[,c(1,2,3)] %>% distinct()
+bbc<- bb
+bbc$C<-gsub(' \\[(.)*', '', bbc$C)
+bbc$C = gsub('[^A-Za-z0-9]', '.', bbc$C)
+xx<-bbc[match(rownames(liz.ppca3$c1)[which(rownames(liz.ppca3$c1)%in%(cc.g %>% labels))],bbc$C),] # Order to match the fun.C2.9K object
+xx[,1]<-as.factor(xx[,1])
+
+# colors to use: 
+colors_to_use <- as.numeric(xx[,1])
+# shapes to use:
+xx$shape<-NA
+for (i in 1:length(unique(xx$A))){
+  xx[which(xx$A==unique(xx$A)[i]),4]<-match(xx[which(xx$A==unique(xx$A)[i]),]$B,unique(xx[which(xx$A==unique(xx$A)[i]),]$B))
+}
+shapes_to_use<-xx$shape
+
+# But sort them based on their order in dend:
+colors_to_use <- colors_to_use[order.dendrogram(dend)]
+shapes_to_use <- shapes_to_use[order.dendrogram(dend)]
+labels_colors(dend) <- colors_to_use
+
+# Color branches by genomic groups to compare with groupings from OPTION 1
+labels.g <- dend %>% labels # set("labels_to_char") %>% 
+labels.g <- as.data.frame(labels.g)
+
+### Adding colored bars with pcoa R2 groupings from below
+contrib.bar.g<-liz.ppca3$c1[,c(1:4)]
+contrib.bar.g<-contrib.bar.g[match(labels.g[,1],rownames(contrib.bar.g)),]
+
+# Generate color lookup table (all tog)
+max(abs(contrib.bar.g)) # 0.31
+scale_range <- c(-0.60, 0.60) # Needs to be symmetric
+pal<-colorNumeric("RdBu", domain = scale_range)
+contrib.col.g<-apply(contrib.bar.g,2,pal)
+rownames(contrib.col.g)<-rownames(contrib.bar.g)
+
+# Adding colored bars with abundance
+abund<-as.data.frame(colSums(dat))
+rownames(abund)<-colnames(dat)
+rownames(abund)<-gsub(' \\[(.)*', '', rownames(abund))
+rownames(abund) = gsub('[^A-Za-z0-9]', '.', rownames(abund))
+abund<-abund[match(rownames(contrib.bar.g),rownames(abund)),,drop=F]
+
+# Generate color lookup table (all tog)
+max(abs(abund)) # 1929
+scale_range2 <- c(0,5100)
+pal2<-colorNumeric("YlOrRd", domain = scale_range2)
+abund.col<-apply(abund,2,pal2)
+rownames(abund.col)<-rownames(abund)
+
+# Plotting
+par(mar=c(25,2.5,2.5,1))
+dend %>% #pvclust_show_signif(fit.g, show_type = "lwd", alpha=0.05) %>% 
+  set("leaves_pch", shapes_to_use) %>%  # node point type
+  set("leaves_cex", 1) %>%  # node point size
+  set("leaves_col", colors_to_use) %>% #node point color
+  set("labels_cex", 0.75) %>%
+  plot(main = "Cluster dendrogram with AU/BP values (%)\n bp values are highlighted by signif")
+legend("topright", legend = levels(xx[,1]), fill = c(1:5), cex = 0.65, text.width=25, bty='n', pt.cex=0.2, y.intersp=0.5)
+colored_bars(contrib.col.g, dend, sort_by_labels_order = F, rowLabels= colnames(contrib.col.g), y_shift=-0.75)
+colored_bars(abund.col, dend, sort_by_labels_order = F, y_shift=-1)
+```
+
+Subset dendrogram plot (see object created below)
+
+```{r}
+# Plotting with dendextend
+# pvclust object can also be plotted with dendextend
+# https://cran.r-project.org/web/packages/dendextend/vignettes/introduction.html#pvclust
+
+dend <- as.dendrogram(cc.gp)
+
+# Color based on A category
+xx<- kegg.cat[,c(1,2,3)] %>% distinct()
+xx$C<-gsub(' \\[(.)*', '', xx$C)
+xx<-xx[match(rownames(liz.ppca2$c1)[which(rownames(liz.ppca2$c1)%in%ml)],xx$C),] # Order to match the fun.C2.9K object
+
+# colors to use: 
+colors_to_use <- as.numeric(xx[,1])
+# shapes to use:
+xx$shape<-NA
+for (i in 1:length(unique(xx$A))){
+  xx[which(xx$A==unique(xx$A)[i]),4]<-match(xx[which(xx$A==unique(xx$A)[i]),]$B,unique(xx[which(xx$A==unique(xx$A)[i]),]$B))
+}
+shapes_to_use<-xx$shape
+
+# But sort them based on their order in dend:
+colors_to_use <- colors_to_use[order.dendrogram(dend)]
+shapes_to_use <- shapes_to_use[order.dendrogram(dend)]
+labels_colors(dend) <- colors_to_use
+
+# Color branches by genomic groups to compare with groupings from OPTION 1
+labels.g <- dend %>% set("labels_to_char") %>% labels 
+labels.g <- as.data.frame(labels.g)
+
+### Adding colored bars with pcoa R2 groupings from below
+contrib.bar.g<-liz.ppca2$c1[which(rownames(liz.ppca2$c1)%in%labels.g[,1]),c(1:5)]
+contrib.bar.g<-contrib.bar.g[match(labels.g[,1],rownames(contrib.bar.g)),]
+
+# Generate color lookup table (all tog)
+max(abs(contrib.bar.g)) # 0.3
+scale_range <- c(-0.3, 0.3) # Needs to be symmetric
+pal<-colorNumeric("RdBu", domain = scale_range)
+contrib.col.g<-apply(contrib.bar.g,2,pal)
+rownames(contrib.col.g)<-rownames(contrib.bar.g)
+
+# Adding colored bars with abundance
+abund<-as.data.frame(colSums(dat[,which(colnames(dat)%in%rownames(contrib.bar.g))]))
+rownames(abund)<-colnames(dat[,which(colnames(dat)%in%rownames(contrib.bar.g))])
+abund<-abund[match(rownames(contrib.bar.g),rownames(abund)),,drop=F]
+
+# Generate color lookup table (all tog)
+max(abs(abund)) # 15685
+scale_range2 <- c(0,16000)
+pal2<-colorNumeric("YlOrRd", domain = scale_range2)
+abund.col<-apply(abund,2,pal2)
+rownames(abund.col)<-rownames(abund)
+
+# Plotting
+par(mar=c(25,2.5,2.5,1))
+dend %>% #pvclust_show_signif(fit.g, show_type = "lwd", alpha=0.05) %>% 
+  set("leaves_pch", shapes_to_use) %>%  # node point type
+  set("leaves_cex", 1) %>%  # node point size
+  set("leaves_col", colors_to_use) %>% #node point color
+  set("labels_cex", 0.75) %>%
+  plot(main = "Cluster dendrogram with AU/BP values (%)\n bp values are highlighted by signif")
+legend("topright", legend = levels(xx[,1]), fill = c(1:5), cex = 0.65, text.width=25, bty='n', pt.cex=0.2, y.intersp=0.5)
+colored_bars(contrib.col.g, dend, sort_by_labels_order = F, rowLabels= colnames(contrib.col.g), y_shift=-1)
+colored_bars(abund.col, dend, sort_by_labels_order = F, y_shift=-1.5)
+```
+
+### Comparison of functional correlations: M vs P
+
+#### Generate tanglegram
+
+```{r}
+# Use objects cc.g and cc.m
+
+# Prune leaves of each dendrogram so the same functions are present in each tree
+# Extract labels
+gl <- cc.g %>% labels
+ml<-cc.m3 %>% labels
+# Identify and remove leaves present in genomic but not metagenomic dataset
+lf<-setdiff(gl, ml)
+cc.gp<-dendextend::prune(cc.g, leaves=lf)
+# Identify and remove leaves present in metagenomic but not genomic dataset
+lf<-setdiff(ml, gl)
+cc.mp<-dendextend::prune(cc.m3, leaves=lf)
+
+# Create a dendlist
+dl <- dendlist(cc.mp,cc.gp)
+
+# Find and generate best configuration
+dl %>% entanglement # lower is better # 0.69 # 0.68 (unassemb)
+dl %>% dendextend::untangle(method = "random", R = 10) %>% entanglement # 0.41 # 0.34 (unassemb)
+# dl %>% dendextend::untangle(method = "step2side") %>% entanglement # 0.23 
+
+dl2<-dl %>% dendextend::untangle(method = "step2side")
+```
+
+Plot tanglegram [visualization tool]
+
+```{r}
+# Color leaf nodes based on A category of genomic dataset
+# Shapes based on B category of genomic dataset
+
+# Color leaf nodes based on A category of genomic dataset
+# Shapes based on B category of genomic dataset
+
+### Metagenomic dataset
+
+xx<- kegg.cat[,c(1,2,3)] %>% distinct()
+xx$C<-gsub(' \\[(.)*', '', xx$C)
+
+hb<-dl2[[1]] %>% labels
+xx<-xx[match(hb,xx$C),] # Order to match the fun1 object
+
+xx[,1]<-as.factor(xx[,1])
+xx[,2]<-as.factor(xx[,2])
+xx[,3]<-as.factor(xx[,3])
+
+# OPTION 2
+# Shapes to use (A cat)
+sh<-as.data.frame(cbind(levels(xx$A),seq(1,length(levels(xx$A)))))
+sh$V2<-as.numeric(sh$V2)
+shuse<-merge(xx,sh, by.x='A', by.y='V1', all.x=T)
+shuse<-shuse[match(hb,shuse$C),]
+
+shapes_to_use <- as.numeric(shuse$V2)
+# conversion table
+length(unique(shapes_to_use)) # 5 shapes
+# Define shapes
+st<-c(0,3,2,7,1) # 1,6,15,17,19
+#shapes_to_use<-st[shapes_to_use]
+shapes_to_use<-rep(19, length(shapes_to_use))
+
+#Black as color
+colors_to_use <- as.numeric(factor(xx[,1]))
+#colors_to_use<-rep('black', length(shapes_to_use))
+
+# Apply these parameters to the metagenomic part of the tanglegram
+dl2[[1]] <- dl2[[1]] %>% dendextend::set("leaves_pch", shapes_to_use) %>% dendextend::set("leaves_col", colors_to_use) %>% dendextend::set("leaves_cex", 1) 
+
+### Genomic dataset
+
+xx<- kegg.cat[,c(1,2,3)] %>% distinct()
+xx$C<-gsub(' \\[(.)*', '', xx$C)
+
+hb<-dl2[[2]] %>% labels
+xx<-xx[match(hb,xx$C),] # Order to match the fun.C2.9K object
+
+# OPTION 1
+# colors to use (A cat)
+# colors_to_use <- as.numeric(xx[,1])
+# shapes to use (B cat)
+#xx$shape<-NA
+#for (i in 1:length(unique(xx$A))){
+#  xx[which(xx$A==unique(xx$A)[i]),4]<-match(xx[which(xx$A==unique(xx$A)[i]),]$B,unique(xx[which(xx$A==unique(xx$A)[i]),]$B))
+#}
+#shapes_to_use<-xx$shape
+
+# Select same shapes as for the other graph
+
+xx[,1]<-as.factor(xx[,1])
+xx[,2]<-as.factor(xx[,2])
+xx[,3]<-as.factor(xx[,3])
+
+# Shapes to use (A cat)
+sh<-as.data.frame(cbind(levels(xx$A),seq(1,length(levels(xx$A)))))
+sh$V2<-as.numeric(sh$V2)
+shuse<-merge(xx,sh, by.x='A', by.y='V1', all.x=T)
+shuse<-shuse[match(hb,shuse$C),]
+
+shapes_to_use <- as.numeric(shuse$V2)
+# conversion table
+length(unique(shapes_to_use)) # 5 shapes
+# Define shapes
+st<-c(0,3,2,7,1) # 1,6,15,17,19
+#shapes_to_use<-st[shapes_to_use]
+shapes_to_use<-rep(19, length(shapes_to_use))
+
+# Black as color
+# colors to use: 
+colors_to_use <- as.numeric(factor(xx[,1]))
+#colors_to_use<-rep('black', length(shapes_to_use))
+
+# Apply these parameters to the metagenomic part of the tanglegram
+dl2[[2]] <- dl2[[2]] %>% dendextend::set("leaves_pch", shapes_to_use) %>% dendextend::set("leaves_col", colors_to_use) %>% dendextend::set("leaves_cex", 1) 
+
+#Adjust symbol position so it is not cut
+dl2[[1]] <- hang.dendrogram.md(dl2[[1]])
+dl2[[2]] <- hang.dendrogram.md(dl2[[2]])
+
+# Generate colored bars to identify groups : will need to add this by hand, so leave space to plot it
+labels.m <- dl2[[1]] %>% set("labels_to_char") %>% labels 
+labels.m <- as.data.frame(labels.m)
+
+# Generate groups
+groups8G<-cutree(cc.m3, k=9, order_clusters_as_data = FALSE)
+
+groups.m<-as.data.frame(groups8G)
+labels2 <- merge(labels.m, groups.m, by.x="labels.m", by.y="row.names", sort=F, all.x=T)
+
+colourCount = length(unique(as.factor(groups.m$groups8G)))
+cols<-brewer.pal(colourCount, "Paired")
+cold<-as.data.frame(cbind(unique(as.factor(groups.m$groups8G)), cols))
+cold$V1<-as.numeric(as.character(cold$V1))
+cm<-match(labels2$groups8G, cold$V1)
+cols <- as.character(cold$cols[cm])
+
+# Color left branches by genomic groups
+# Extract color names from hexa colors
+#numcol<-sapply(unique(cols), color.id)
+dl2[[1]]<- dl2[[1]] %>% set("branches_k_color", k=9, value=unique(cols))
+
+# Make tanglegram 14x16po
+tanglegram(dl2, color_lines = cols, highlight_distinct_edges  = FALSE, margin_inner=12, dLeaf_left = -0.8, dLeaf_right=0.8, lwd=3.5, lab.cex=0.45, columns_width=c(3,3,3)) # , , columns_width=c(6,6,6)
+
+# Make legend (overplot, too much fuss including it into the tanglegram)
+plot(0,0)
+legend("center", legend = levels(shuse$A), pch = st, ncol=1,  pt.cex=1.5)
+
+
+```
+
+
+#### Procrustes analyses on cophenetic distances
+
+```{r}
+# Include only those functions from cog.clust.g
+
+## Compute cophenetic distances
+cog.Dg.co<-cophenetic(cc.gp)
+cog.Dm.co<-cophenetic(cc.mp)
+
+## Procrustes
+p<-procrustes(cog.Dg.co, cog.Dm.co, translation=TRUE, dilation=TRUE)
+plot(p)
+protest(cog.Dg.co, cog.Dm.co) 
+
+```
